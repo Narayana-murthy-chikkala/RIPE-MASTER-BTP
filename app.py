@@ -230,6 +230,25 @@ def extract_keypoints(
         logger.info("Matching descriptors...")
         matcher = KF.DescriptorMatcher("mnn")
         match_dists, match_idxs = matcher(desc_1, desc_2)
+
+        # 🔥 keep strongest matches only
+        k = min(200, match_dists.shape[0])
+        order = torch.argsort(match_dists.squeeze())
+        order = order[:k]
+
+        match_dists = match_dists[order]
+        match_idxs = match_idxs[order]
+
+        # 🔥 spatial sanity filtering
+        pts1 = kpts_1[match_idxs[:, 0]]
+        pts2 = kpts_2[match_idxs[:, 1]]
+
+        spatial_dist = torch.norm(pts1 - pts2, dim=1)
+        keep = spatial_dist < 300.0
+
+        match_dists = match_dists[keep]
+        match_idxs = match_idxs[keep]
+
         cv2_matches = cv2_matches_from_kornia(match_dists, match_idxs)
         
         log_text += f"MNN matches: {match_idxs.shape[0]}\n"

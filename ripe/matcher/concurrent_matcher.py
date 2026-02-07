@@ -1,5 +1,5 @@
 import torch
-from typing import Optional, List, Tuple, Callable
+from typing import Optional, Callable
 import logging
 
 logger = logging.getLogger(__name__)
@@ -9,10 +9,11 @@ class ConcurrentMatcher:
     """
     Deterministic real-time matcher
 
-    - Stable top-K matches
-    - Keypoint cap
-    - Sequential RANSAC (deterministic)
-    - PROSAC ordering
+    Improvements:
+    - Keep only strongest matches (quality > quantity)
+    - Spatial sanity filtering
+    - PROSAC-style ordering (best first)
+    - Stable deterministic behavior
     """
 
     def __init__(
@@ -22,12 +23,14 @@ class ConcurrentMatcher:
         min_num_matches: int = 8,
         max_matches: int = 200,
         max_keypoints: int = 1024,
+        spatial_th: float = 300.0,   # 🔥 NEW: position sanity threshold (pixels)
     ):
         self.matcher = matcher
         self.robust_estimator = robust_estimator
         self.min_num_matches = min_num_matches
         self.max_matches = max_matches
         self.max_keypoints = max_keypoints
+        self.spatial_th = spatial_th
 
     def _cap_keypoints(self, desc, mask):
         idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
@@ -35,13 +38,32 @@ class ConcurrentMatcher:
         return desc[idx], idx
 
     def _topk_matches(self, dists, idx_matches):
-        k = min(self.max_matches, dists.shape[0])
-        best = torch.topk(dists.squeeze(), k, largest=False).indices
+        """
+        Keep only strongest matches.
+        Smaller distance = stronger match.
+        """
 
-        # deterministic ordering
-        best = best.sort().values
+        k = min(self.max_matches, dists.shape[0])
+
+        # sort by distance (best first)
+        order = torch.argsort(dists.squeeze())
+        best = order[:k]
 
         return dists[best], idx_matches[best]
+
+    def _spatial_filter(self, kpts1, kpts2, idx_matches):
+        """
+        Remove matches that jump unrealistically far.
+        Basic sanity check.
+        """
+
+        pts1 = kpts1[idx_matches[:, 0]]
+        pts2 = kpts2[idx_matches[:, 1]]
+
+        dist = torch.norm(pts1 - pts2, dim=1)
+        keep = dist < self.spatial_th
+
+        return idx_matches[keep], keep
 
     @torch.no_grad()
     def __call__(
@@ -72,8 +94,21 @@ class ConcurrentMatcher:
             if desc1.shape[0] < 16 or desc2.shape[0] < 16:
                 continue
 
+            # MNN matching
             dists, idx_matches = self.matcher(desc1, desc2)
+
+            # keep only strongest matches
             dists, idx_matches = self._topk_matches(dists, idx_matches)
+
+            # spatial sanity filter
+            idx_matches, keep_mask = self._spatial_filter(
+                kpts1[b][idx1],
+                kpts2[b][idx2],
+                idx_matches
+            )
+
+            if idx_matches.shape[0] == 0:
+                continue
 
             batch_rel_idx_matches[b] = idx_matches.clone()
 
@@ -98,7 +133,7 @@ class ConcurrentMatcher:
             mkpts1 = kpts1[b][idx_matches[:, 0]]
             mkpts2 = kpts2[b][idx_matches[:, 1]]
 
-            # ⭐ sequential deterministic RANSAC
+            # PROSAC behavior = already sorted by strength
             Fm, inl = self.robust_estimator(mkpts1, mkpts2, inl_th)
 
             batch_ransac_inliers[b] = inl
